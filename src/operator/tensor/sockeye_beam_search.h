@@ -172,8 +172,6 @@ void SockeyeBeamSearchForwardCpu(const nnvm::NodeAttrs& attrs,
   // Use threading to speed up
   const int omp_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount());
 
-//  std::cout<<"THREADS = "<<omp_threads<<std::endl;
-
   DType *scores     = inputs[beam::kscore].dptr<DType>();
   DType *scores_acc = inputs[beam::kscore_acc].dptr<DType>();
   DType *lengths    = inputs[beam::klen].dptr<DType>();
@@ -201,7 +199,7 @@ void SockeyeBeamSearchForwardCpu(const nnvm::NodeAttrs& attrs,
     return pow((parms.beta + length)/(parms.beta+1), parms.alpha);
   };
   DType infty(red::limits::MaxValue<DType>());
-  #pragma omp parallel for num_threads(omp_threads)    
+  #pragma omp parallel for num_threads(omp_threads)
   for (int i = 0; i < M; ++i) {
     int N(inputs[beam::kscore].shape_[1]);
     if (finished[i]) {    
@@ -231,7 +229,7 @@ void SockeyeBeamSearchForwardCpu(const nnvm::NodeAttrs& attrs,
   // if self.restrict_lexicon:
   //     best_word_indices[:] = vocab_slice_ids.take(best_word_indices)
   std::vector<int> best_word_indices(M);
-  #pragma omp parallel for num_threads(omp_threads)    
+  #pragma omp parallel for num_threads(omp_threads)
   for (int i = 0; i < M; i += beam_size) {
     int N(inputs[beam::kscore].shape_[1]);
     // Examine only first row for t==1. 
@@ -253,7 +251,7 @@ void SockeyeBeamSearchForwardCpu(const nnvm::NodeAttrs& attrs,
   }
   
   // # (4) get hypotheses and their properties for beam_size winning hypotheses (ascending) 
-  #pragma omp parallel sections
+  #pragma omp parallel sections num_threads(omp_threads)
   { 
     #pragma omp section
     {
@@ -281,21 +279,21 @@ void SockeyeBeamSearchForwardCpu(const nnvm::NodeAttrs& attrs,
       TakeRows(att_scores, best_hyp, M, inputs[beam::katt_score].shape_.Size()/M);
     }
   }
-   
-  #pragma omp parallel for num_threads(omp_threads)    
+
+  #pragma omp parallel for num_threads(omp_threads)
   for (int i = 0; i < M; ++i) {
     const int t(parms.step);
     // # (5) update best hypotheses, their attention lists and lengths (only for non-finished hyps)
     // sequences[:, t] = best_word_indices
     sequences[i*max_output_length+t] = best_word_indices[i];
     // attentions[:, t, :] = attention_scores
-    std::memcpy(att+(i*max_output_length+t)*encoded_source_length, 
-                att_scores+i*encoded_source_length, encoded_source_length*sizeof(DType));
+    std::copy(att_scores+i*encoded_source_length, att_scores+(i+1)*encoded_source_length, 
+              att+(i*max_output_length+t)*encoded_source_length);
     //lengths += mx.nd.cast(1 - mx.nd.expand_dims(finished, axis=1), dtype='float32')
     lengths[i] += 1.0 - finished[i];
     // # (6) determine which hypotheses in the beam are now finished
     // finished = ((best_word_indices == C.PAD_ID) + (best_word_indices == self.vocab_target[C.EOS_SYMBOL]))
-    finished[i] = (best_word_indices[i] == parms.pad_id) || (best_word_indices[i] == parms.eos_id);
+    finished[i] = ((best_word_indices[i] == parms.pad_id) || (best_word_indices[i] == parms.eos_id) ? 1 : 0);
   }
   const bool done(std::find(finished, finished+M, 0) == finished+M);
   (*outputs[0].dptr<int>()) = done;
