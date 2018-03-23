@@ -170,7 +170,9 @@ void SockeyeBeamSearchForwardCpu(const nnvm::NodeAttrs& attrs,
   const int encoded_source_length(inputs[beam::katt].shape_[2]);
  
   // Use threading to speed up
-  const int omp_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount());
+  //const int omp_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount());
+  // FIXIT: Use fixed minimum number of threads as engine will restrict it to 1 on GPU
+  const int omp_threads(std::max(2, engine::OpenMP::Get()->GetRecommendedOMPThreadCount()));
 
   DType *scores     = inputs[beam::kscore].dptr<DType>();
   DType *scores_acc = inputs[beam::kscore_acc].dptr<DType>();
