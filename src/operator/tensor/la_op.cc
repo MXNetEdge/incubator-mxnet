@@ -46,8 +46,9 @@ If *n=2*, the BLAS3 function *gemm* is performed:
 Here, *alpha* and *beta* are scalar parameters, and *op()* is either the identity or
 matrix transposition (depending on *transpose_a*, *transpose_b*).
 
-If *n>2*, *gemm* is performed separately on the trailing two dimensions for all inputs
-(batch mode).
+If *n>2*, *gemm* is performed separately for a batch of matrices. The columns of the matrices
+are given by the last dimensions of the tensors, the rows by the axis specified with the *axis* 
+parameter. By default, the trailing two dimensions will be used for matrix encoding.
 
 .. note:: The operator supports float32 and float64 data types only.
 
@@ -76,7 +77,7 @@ Examples::
 .set_attr<nnvm::FInferType>("FInferType", ElemwiseType<3, 1>)
 .set_attr<nnvm::FInplaceOption>("FInplaceOption", [](const NodeAttrs& attrs)
   { return std::vector<std::pair<int, int>>{{2, 0}}; })
-.set_attr<FCompute>("FCompute<cpu>", LaOpForward<cpu, 2, 2, 3, 1, gemm>)
+.set_attr<FCompute>("FCompute<cpu>", LaOpGemmForward<cpu, 2, 2, 3, 1, gemm>)
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseIn{"_backward_linalg_gemm"})
 .add_argument("A", "NDArray-or-Symbol", "Tensor of input matrices")
 .add_argument("B", "NDArray-or-Symbol", "Tensor of input matrices")
@@ -92,7 +93,7 @@ NNVM_REGISTER_OP(_backward_linalg_gemm)
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& attrs)
   { return std::vector<ResourceRequest>{ResourceRequest::kTempSpace}; })
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
-.set_attr<FCompute>("FCompute<cpu>", LaOpBackward<cpu, 2, 2, 4, 3, gemm_backward>);
+.set_attr<FCompute>("FCompute<cpu>", LaOpGemmBackward<cpu, 2, 2, 4, 3, gemm_backward>);
 
 NNVM_REGISTER_OP(_linalg_gemm2)
 .add_alias("linalg_gemm2")
@@ -107,8 +108,9 @@ If *n=2*, the BLAS3 function *gemm* is performed:
 Here *alpha* is a scalar parameter and *op()* is either the identity or the matrix
 transposition (depending on *transpose_a*, *transpose_b*).
 
-If *n>2*, *gemm* is performed separately on the trailing two dimensions for all inputs
-(batch mode).
+If *n>2*, *gemm* is performed separately for a batch of matrices. The columns of the matrices
+are given by the last dimensions of the tensors, the rows by the axis specified with the *axis* 
+parameter. By default, the trailing two dimensions will be used for matrix encoding.
 
 .. note:: The operator supports float32 and float64 data types only.
 
@@ -133,7 +135,7 @@ Examples::
   { return std::vector<std::string>{"A", "B"}; } )
 .set_attr<nnvm::FInferShape>("FInferShape", LaMatrixMultMacOpShape)
 .set_attr<nnvm::FInferType>("FInferType", ElemwiseType<2, 1>)
-.set_attr<FCompute>("FCompute<cpu>", LaOpForward<cpu, 2, 2, 2, 1, gemm2>)
+.set_attr<FCompute>("FCompute<cpu>", LaOpGemmForward<cpu, 2, 2, 2, 1, gemm2>)
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseIn{"_backward_linalg_gemm2"})
 .add_argument("A", "NDArray-or-Symbol", "Tensor of input matrices")
 .add_argument("B", "NDArray-or-Symbol", "Tensor of input matrices")
@@ -148,7 +150,7 @@ NNVM_REGISTER_OP(_backward_linalg_gemm2)
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& attrs)
   { return std::vector<ResourceRequest>{ResourceRequest::kTempSpace}; })
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
-.set_attr<FCompute>("FCompute<cpu>", LaOpBackward<cpu, 2, 2, 3, 2, gemm2_backward>);
+.set_attr<FCompute>("FCompute<cpu>", LaOpGemmBackward<cpu, 2, 2, 3, 2, gemm2_backward>);
 
 NNVM_REGISTER_OP(_linalg_potrf)
 .add_alias("linalg_potrf")

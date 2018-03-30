@@ -4106,6 +4106,7 @@ def test_laop():
     rep_3x = lambda a, m, n :\
         np.reshape(np.tile(np.array(a).flatten(), 3), (3, 1, m, n))
 
+    grad_check = 0
     # Test gemm separately from other la-operators.
     shape1 = (2, 3)
     shape2 = (3, 2)
@@ -4142,6 +4143,7 @@ def test_laop():
     if grad_check == 1:
         check_grad(test_gemm, [data_in1, data_in1, data_in4])
 
+    grad_check = 1
     # Check batch of gemm.
     a = rep_3x(data_in1, 2, 3)
     b = rep_3x(data_in2, 3, 2)
@@ -4152,7 +4154,38 @@ def test_laop():
     check_fw(test_gemm, [a, b, c], [r])
     if grad_check == 1:
         check_grad(test_gemm, [a, b, c])
+    print("TEST1")
+    a = rep_3x(data_in1, 2, 3)
+    b = rep_3x(data_in2, 3, 2)
+    c = rep_3x(data_in4, 2, 2)
+    r = 4. * np.dot(data_in1, data_in2) + 7. * data_in4
+    r = rep_3x(r, 2, 2)
+    a = np.copy(np.swapaxes(a, 0, 2))
+    b = np.copy(np.swapaxes(b, 0, 2))
+    c = np.copy(np.swapaxes(c, 0, 2))
+    r = np.copy(np.swapaxes(r, 0, 2))
+    test_gemm = mx.sym.linalg.gemm(data1, data2, data3, alpha=4., beta=7., axis = 0)
+    check_fw(test_gemm, [a, b, c], [r])
+    if grad_check == 1:
+        check_grad(test_gemm, [a, b, c])
 
+
+    print("TEST2")
+    a = rep_3x(data_in1, 2, 3)
+    b = rep_3x(data_in2, 3, 2)
+    c = rep_3x(data_in4, 2, 2)
+    r = 4. * np.dot(data_in1, data_in2) + 7. * data_in4
+    r = rep_3x(r, 2, 2)
+    a = np.copy(np.swapaxes(a, 1, 2))
+    b = np.copy(np.swapaxes(b, 1, 2))
+    c = np.copy(np.swapaxes(c, 1, 2))
+    r = np.copy(np.swapaxes(r, 1, 2))
+    test_gemm = mx.sym.linalg.gemm(data1, data2, data3, alpha=4., beta=7., axis = -3)
+    check_fw(test_gemm, [a, b, c], [r])
+    if grad_check == 1:
+        check_grad(test_gemm, [a, b, c])
+
+    print("TEST3")
     # Check gemm2 operator same way as gemm.
     res_gemm = 4. * np.dot(data_in1, data_in2)
     test_gemm = mx.sym.linalg.gemm2(data1, data2, alpha=4.)
@@ -4176,11 +4209,26 @@ def test_laop():
     if grad_check == 1:
         check_grad(test_gemm, [data_in1, data_in1])
 
+    grad_check = 1
     # Check batch of gemm2.
     a = rep_3x(data_in1, 2, 3)
     b = rep_3x(data_in2, 3, 2)
     r = rep_3x(4. * np.dot(data_in1, data_in2), 2, 2)
-    test_gemm = mx.sym.linalg.gemm2(data1, data2, alpha=4.)
+    a = np.copy(np.swapaxes(a, 0, 2))
+    b = np.copy(np.swapaxes(b, 0, 2))
+    r = np.copy(np.swapaxes(r, 0, 2))
+    test_gemm = mx.sym.linalg.gemm2(data1, data2, alpha=4., axis = 0)
+    check_fw(test_gemm, [a, b], [r])
+    if grad_check == 1:
+        check_grad(test_gemm, [a, b])
+
+    a = rep_3x(data_in1, 2, 3)
+    b = rep_3x(data_in2, 3, 2)
+    r = rep_3x(4. * np.dot(data_in1, data_in2), 2, 2)
+    a = np.copy(np.swapaxes(a, 1, 2))
+    b = np.copy(np.swapaxes(b, 1, 2))
+    r = np.copy(np.swapaxes(r, 1, 2))
+    test_gemm = mx.sym.linalg.gemm2(data1, data2, alpha=4., axis = -3)
     check_fw(test_gemm, [a, b], [r])
     if grad_check == 1:
         check_grad(test_gemm, [a, b])
@@ -5163,5 +5211,4 @@ def test_squeeze_op():
 
 
 if __name__ == '__main__':
-    import nose
-    nose.runmodule()
+    test_laop()
