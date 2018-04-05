@@ -38,6 +38,7 @@
 #include "../operator_common.h"
 #include "../mxnet_op.h"
 #include "../tensor/broadcast_reduce_op.h"
+#include "../linalg.h"
 
 namespace mxnet {
 namespace op {
@@ -63,6 +64,114 @@ struct LayerNormParam : public dmlc::Parameter<LayerNormParam> {
   }
 };
 
+template<typename xpu>
+struct ReduceMean;
+
+#ifdef __CUDACC__
+template<>
+struct ReduceMean<gpu> {
+  template<typename DType>
+  MSHADOW_FORCE_INLINE __device__ static void Map(int i, int N, int K, DType *data, DType *work, DType *out) {
+    const int first((i/K)*N+(i%K)), last((i/K+1)*N);
+    DType acc(0);
+    for( int j = first; j < last; j += K ) {
+      acc += data[j];
+    }
+    work[i] = acc;
+    __syncthreads();
+    if( i%K == 0 ) {
+      acc = 0;
+      for( int j = i; j < i+K; ++j ) {
+        acc += work[j];
+      }
+      out[i/K] = acc/N;
+    }
+  }
+};
+#endif
+
+template<>
+struct ReduceMean<cpu> {
+  template<typename DType>
+  MSHADOW_XINLINE static void Map(int i, int N, int K, DType *data, DType *work, DType *out) {
+    CHECK_EQ(K, 1);
+    const int first(i*N), last((i+1)*N);
+    DType acc(0);
+    for( int j = first; j < last; ++j ) {
+      acc += data[j];
+    }
+    out[i] = acc/N;
+  }
+};
+
+
+template<typename xpu>
+struct ReduceVar;
+
+#ifdef __CUDACC__
+template<>
+struct ReduceVar<gpu> {
+  template<typename DType>
+  MSHADOW_FORCE_INLINE __device__ static void Map(int i, int N, int K, DType eps, DType *mean, DType *data, DType *work, DType *out_data, DType *out_std) {
+    const int first((i/K)*N+(i%K)), last((i/K+1)*N);
+    DType acc(0);
+    DType mu(mean[i/K]);
+    for( int j = first; j < last; j += K ) {
+      DType tmp(data[j]-mu);
+      out_data[j] = tmp;
+      acc += tmp*tmp;
+    }
+    work[i] = acc;
+    __syncthreads();
+    if( i%K == 0 ) {
+      acc = 0;
+      for( int j = i; j < i+K; ++j ) {
+        acc += work[j];
+      }
+      out_std[i/K] = std::sqrt(acc/DType(N)+eps);
+    }
+  }
+};
+#endif
+
+template<>
+struct ReduceVar<cpu> {
+  template<typename DType>
+  MSHADOW_XINLINE static void Map(int i, int N, int K, DType eps, DType *mean, DType *data, DType *work, DType *out_data, DType *out_std) {
+    CHECK_EQ(K, 1);
+    const int first(i*N), last((i+1)*N);
+    DType acc(0);
+    DType mu(mean[i]);
+    for( int j = first; j < last; ++j ) {
+      DType tmp(data[j]-mu);
+      out_data[j] = tmp;
+      acc += tmp*tmp;
+    }
+    out_std[i] = std::sqrt(acc/DType(N)+eps);
+  }
+};
+
+struct ScaleAndShift {
+  template<typename DType>
+  MSHADOW_XINLINE static void Map(int i, int N, DType eps, DType *data, DType *std, DType *beta, DType* gamma) {
+    data[i] = gamma[i%N]*data[i]/std[i/N]+beta[i%N];
+  }
+};
+
+template<typename xpu>
+MSHADOW_XINLINE int GetLaunchK(int M, int N){ return 1; }
+
+template<>
+MSHADOW_XINLINE int GetLaunchK<gpu>(int M, int N)
+{
+  return 32;
+/*
+  const int val(1024/M);
+  int K(1);
+  for( ; K<<1 <= val; K <<= 1 ) {}
+  return K;
+*/
+}
 
 template<typename xpu>
 void LayerNormCompute(const nnvm::NodeAttrs& attrs,
@@ -81,6 +190,30 @@ void LayerNormCompute(const nnvm::NodeAttrs& attrs,
   CHECK(axis >= 0 && axis < inputs[0].ndim()) << "Channel axis out of range: " << param.axis;
   CHECK_EQ(inputs.size(), 3U);
   Stream<xpu> *s = ctx.get_stream<xpu>();
+  if (axis == inputs[0].ndim()-1 ) {
+    MSHADOW_SGL_DBL_TYPE_SWITCH(outputs[0].type_flag_, DType, {
+      using namespace mxnet_op;
+      Tensor<xpu, 2, DType> data  = inputs[layernorm::kData].FlatTo2D<xpu, DType>(s);
+      Tensor<xpu, 1, DType> beta  = inputs[layernorm::kBeta].FlatTo1D<xpu, DType>(s);
+      Tensor<xpu, 1, DType> gamma = inputs[layernorm::kGamma].FlatTo1D<xpu, DType>(s);
+      Tensor<xpu, 2, DType> out   = outputs[layernorm::kOut].FlatTo2D<xpu, DType>(s);
+      Tensor<xpu, 1, DType> mean  = outputs[layernorm::kMean].FlatTo1D<xpu, DType>(s);
+      Tensor<xpu, 1, DType> std   = outputs[layernorm::kStd].FlatTo1D<xpu, DType>(s);
+      const int M(data.size(0)), N(data.size(1));
+      //std::cout<<"LAYER NORM: BATCH = "<<M<<" layer = "<<N<<std::endl;
+      CHECK_EQ(mean.size(0), M);
+      CHECK_EQ(std.size(0), M);
+      CHECK_EQ(beta.size(0), N);
+      CHECK_EQ(gamma.size(0), N);
+      const int K(GetLaunchK<xpu>(M, N));
+      Tensor<xpu, 1, DType> work = ctx.requested[0].get_space_typed<xpu, 1, DType>(Shape1(K*M), s);
+      Kernel<ReduceMean<xpu>, xpu>::Launch(s, M*K, N, K, data.dptr_, work.dptr_, mean.dptr_);
+      Kernel<ReduceVar<xpu>, xpu>::Launch(s, M*K, N, K, DType(param.eps), mean.dptr_, data.dptr_, work.dptr_, out.dptr_, std.dptr_);
+      Kernel<ScaleAndShift, xpu>::Launch(s, M*N, N, DType(param.eps), out.dptr_, std.dptr_, beta.dptr_, gamma.dptr_);
+    });
+    return;
+  }
+
   // Reshape gamma and beta to be broadcastable
   TShape new_param_shape(inputs[0].shape_.begin(), inputs[0].shape_.end());
   for (int i = 0; i < inputs[0].ndim(); i++) {
