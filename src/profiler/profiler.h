@@ -36,11 +36,16 @@
 #include "./vtune.h"
 #include "./aggregate_stats.h"
 
+
 #if defined(_WIN32) || defined(_WIN64) || defined(__WINDOWS__)
 #include <windows.h>
 #else
 #include <unistd.h>
 #include <cstdint>
+#endif
+
+#if MXNET_USE_CUDA
+#include "nvToolsExt.h"
 #endif
 
 namespace mxnet {
@@ -469,7 +474,7 @@ class Profiler {
   /*! \brief Maintain in-memory aggregate stats for print output.
    *  \warning This has a negative performance impact */
   std::shared_ptr<AggregateStats> aggregate_stats_ = nullptr;
-  /*! \brief Asynchronous operation thread lifecycly control object */
+  /*! \brief Asynchronous operation thread lifecycle control object */
   std::shared_ptr<dmlc::ThreadGroup> thread_group_ = std::make_shared<dmlc::ThreadGroup>();
   /* !\brief pids */
   std::unordered_set<uint32_t> process_ids_;
@@ -843,6 +848,7 @@ struct ProfileEvent  : public ProfileDuration {
   void start() override {
     start_time_ = ProfileStat::NowInMicrosec();
     VTUNE_ONLY_CODE(vtune_event_->start());
+    nvtx_range_id_ = nvtxRangeStartA(name_.c_str());
   }
 
   /*!
@@ -850,6 +856,7 @@ struct ProfileEvent  : public ProfileDuration {
    */
   void stop() override {
     VTUNE_ONLY_CODE(vtune_event_->stop());
+    nvtxRangeEnd(nvtx_range_id_);
     SendStat();
   }
 
@@ -895,6 +902,7 @@ struct ProfileEvent  : public ProfileDuration {
  protected:
   /*! \brief Start time of the event */
   uint64_t start_time_;
+  nvtxRangeId_t nvtx_range_id_;
 };
 
 /*!
