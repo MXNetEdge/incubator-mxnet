@@ -64,114 +64,144 @@ struct LayerNormParam : public dmlc::Parameter<LayerNormParam> {
   }
 };
 
-template<typename xpu>
-struct ReduceMean;
-
-#ifdef __CUDACC__
-template<>
-struct ReduceMean<gpu> {
-  template<typename DType>
-  MSHADOW_FORCE_INLINE __device__ static void Map(int i, int N, int K, DType *data, DType *work, DType *out) {
-    const int first((i/K)*N+(i%K)), last((i/K+1)*N);
-    DType acc(0);
-    for( int j = first; j < last; j += K ) {
-      acc += data[j];
-    }
-    work[i] = acc;
-    __syncthreads();
-    if( i%K == 0 ) {
-      acc = 0;
-      for( int j = i; j < i+K; ++j ) {
-        acc += work[j];
-      }
-      out[i/K] = acc/N;
-    }
-  }
-};
-#endif
-
-template<>
-struct ReduceMean<cpu> {
-  template<typename DType>
-  MSHADOW_XINLINE static void Map(int i, int N, int K, DType *data, DType *work, DType *out) {
-    CHECK_EQ(K, 1);
-    const int first(i*N), last((i+1)*N);
-    DType acc(0);
-    for( int j = first; j < last; ++j ) {
-      acc += data[j];
-    }
-    out[i] = acc/N;
-  }
-};
-
-
-template<typename xpu>
-struct ReduceVar;
-
-#ifdef __CUDACC__
-template<>
-struct ReduceVar<gpu> {
-  template<typename DType>
-  MSHADOW_FORCE_INLINE __device__ static void Map(int i, int N, int K, DType eps, DType *mean, DType *data, DType *work, DType *out_data, DType *out_std) {
-    const int first((i/K)*N+(i%K)), last((i/K+1)*N);
-    DType acc(0);
-    DType mu(mean[i/K]);
-    for( int j = first; j < last; j += K ) {
-      DType tmp(data[j]-mu);
-      out_data[j] = tmp;
-      acc += tmp*tmp;
-    }
-    work[i] = acc;
-    __syncthreads();
-    if( i%K == 0 ) {
-      acc = 0;
-      for( int j = i; j < i+K; ++j ) {
-        acc += work[j];
-      }
-      out_std[i/K] = std::sqrt(acc/DType(N)+eps);
-    }
-  }
-};
-#endif
-
-template<>
-struct ReduceVar<cpu> {
-  template<typename DType>
-  MSHADOW_XINLINE static void Map(int i, int N, int K, DType eps, DType *mean, DType *data, DType *work, DType *out_data, DType *out_std) {
-    CHECK_EQ(K, 1);
-    const int first(i*N), last((i+1)*N);
-    DType acc(0);
-    DType mu(mean[i]);
-    for( int j = first; j < last; ++j ) {
-      DType tmp(data[j]-mu);
-      out_data[j] = tmp;
-      acc += tmp*tmp;
-    }
-    out_std[i] = std::sqrt(acc/DType(N)+eps);
-  }
-};
-
 struct ScaleAndShift {
   template<typename DType>
-  MSHADOW_XINLINE static void Map(int i, int N, DType eps, DType *data, DType *std, DType *beta, DType* gamma) {
+  MSHADOW_XINLINE static void Map(int i, int N, DType *data, DType *std, DType *beta, DType* gamma) {
     data[i] = gamma[i%N]*data[i]/std[i/N]+beta[i%N];
   }
 };
 
 template<typename xpu>
-MSHADOW_XINLINE int GetLaunchK(int M, int N){ return 1; }
+MSHADOW_FORCE_INLINE void LayerNormComputeFast(const nnvm::NodeAttrs& attrs,
+                                          const OpContext& ctx, const std::vector<TBlob>& inputs,
+                                          const std::vector<OpReqType>& req,
+                                          const std::vector<TBlob>& outputs);
 
 template<>
-MSHADOW_XINLINE int GetLaunchK<gpu>(int M, int N)
-{
-  return 32;
-/*
-  const int val(1024/M);
-  int K(1);
-  for( ; K<<1 <= val; K <<= 1 ) {}
-  return K;
-*/
+MSHADOW_FORCE_INLINE void LayerNormComputeFast<cpu>(const nnvm::NodeAttrs& attrs,
+                                               const OpContext& ctx, const std::vector<TBlob>& inputs,
+                                               const std::vector<OpReqType>& req,
+                                               const std::vector<TBlob>& outputs) {
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  const LayerNormParam& param = nnvm::get<LayerNormParam>(attrs.parsed);
+  Stream<cpu> *s = ctx.get_stream<cpu>();
+  MSHADOW_SGL_DBL_TYPE_SWITCH(outputs[0].type_flag_, DType, {
+    using namespace mxnet_op;
+    Tensor<cpu, 2, DType> data  = inputs[layernorm::kData].FlatTo2D<cpu, DType>(s);
+    Tensor<cpu, 1, DType> beta  = inputs[layernorm::kBeta].FlatTo1D<cpu, DType>(s);
+    Tensor<cpu, 1, DType> gamma = inputs[layernorm::kGamma].FlatTo1D<cpu, DType>(s);
+    Tensor<cpu, 2, DType> out   = outputs[layernorm::kOut].FlatTo2D<cpu, DType>(s);
+    Tensor<cpu, 1, DType> mean  = outputs[layernorm::kMean].FlatTo1D<cpu, DType>(s);
+    Tensor<cpu, 1, DType> std   = outputs[layernorm::kStd].FlatTo1D<cpu, DType>(s);
+    const int M(data.size(0)), N(data.size(1));
+    CHECK_EQ(mean.size(0), M);
+    CHECK_EQ(std.size(0), M);
+    CHECK_EQ(beta.size(0), N);
+    CHECK_EQ(gamma.size(0), N);
+    for( int i = 0; i < M; ++i ) {
+      // Compute mean. 
+      DType& mu = mean.dptr_[i];
+      DType* val = data.dptr_+i*N;
+      mu = 0;
+      for( int j = 0; j < N; ++j ) {
+        mu += val[j];
+      }
+      mu /= N;
+      // Compute std.
+      DType& var = std.dptr_[i];
+      DType* res = out.dptr_+i*N;
+      var = 0;
+      for( int j = 0; j < N; ++j ) {
+        res[j] = val[j] - mu;
+        var += res[j]*res[j];
+      }
+      var = std::sqrt(var/DType(N)+param.eps);
+    }
+    Kernel<ScaleAndShift, cpu>::Launch(s, M*N, N, out.dptr_, std.dptr_, beta.dptr_, gamma.dptr_);
+  });
 }
+
+#ifdef __CUDACC__
+
+template<typename DType>
+__global__ void reduce_mean(int N, DType *data,  DType *mean) {
+  extern __shared__ int s[];
+  DType *sum = (DType *)(&s[0])+threadIdx.x;
+  data += blockIdx.x*N;
+  DType acc(0);
+  for( int i = threadIdx.x; i < N; i += blockDim.x ) {
+    acc += data[i];
+  }
+  *sum = acc;
+  // Recursive merge on thread block.
+  for (unsigned int s = (blockDim.x+1)/2, last_s = blockDim.x; last_s > 1; last_s = s, s = (s+1)/2) {
+    __syncthreads();
+    if (threadIdx.x < s && threadIdx.x+s < last_s ) {  
+      *sum += *(sum + s);
+    }
+  }
+  if( threadIdx.x == 0 ) {
+    mean[blockIdx.x] = *sum/N;
+  }  
+}
+
+template<typename DType>
+__global__ void reduce_std(int N, DType eps, DType *data,  DType *mean, DType *std, DType *out) {
+  extern __shared__ int s[];
+  DType *sum = (DType *)(&s[0])+threadIdx.x;
+  data += blockIdx.x*N;
+  out += blockIdx.x*N;
+  DType acc(0), mu(mean[blockIdx.x]);
+  for( int i = threadIdx.x; i < N; i += blockDim.x ) {
+    DType tmp(data[i]-mu);
+    acc += tmp*tmp;
+    out[i] = tmp;
+  }
+  // Recursive merge on thread block.
+  *sum = acc;
+  for (unsigned int s = (blockDim.x+1)/2, last_s = blockDim.x; last_s > 1; last_s = s, s = (s+1)/2) {
+    __syncthreads();
+    if (threadIdx.x < s && threadIdx.x+s < last_s ) { 
+      *sum += *(sum + s);
+    }
+  }
+  if( threadIdx.x == 0 ) {
+    std[blockIdx.x] = sqrt(*sum/DType(N)+eps);
+  }
+} 
+
+template<>
+MSHADOW_FORCE_INLINE void LayerNormComputeFast<gpu>(const nnvm::NodeAttrs& attrs,
+                                               const OpContext& ctx, const std::vector<TBlob>& inputs,
+                                               const std::vector<OpReqType>& req,
+                                               const std::vector<TBlob>& outputs) {
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  const LayerNormParam& param = nnvm::get<LayerNormParam>(attrs.parsed);
+  Stream<gpu> *s = ctx.get_stream<gpu>();
+  MSHADOW_SGL_DBL_TYPE_SWITCH(outputs[0].type_flag_, DType, {
+    using namespace mxnet_op;
+    Tensor<gpu, 2, DType> data  = inputs[layernorm::kData].FlatTo2D<gpu, DType>(s);
+    Tensor<gpu, 1, DType> beta  = inputs[layernorm::kBeta].FlatTo1D<gpu, DType>(s);
+    Tensor<gpu, 1, DType> gamma = inputs[layernorm::kGamma].FlatTo1D<gpu, DType>(s);
+    Tensor<gpu, 2, DType> out   = outputs[layernorm::kOut].FlatTo2D<gpu, DType>(s);
+    Tensor<gpu, 1, DType> mean  = outputs[layernorm::kMean].FlatTo1D<gpu, DType>(s);
+    Tensor<gpu, 1, DType> std   = outputs[layernorm::kStd].FlatTo1D<gpu, DType>(s);
+    const int M(data.size(0)), N(data.size(1));
+    CHECK_EQ(mean.size(0), M);
+    CHECK_EQ(std.size(0), M);
+    CHECK_EQ(beta.size(0), N);
+    CHECK_EQ(gamma.size(0), N);
+    const int K(32); // Rows have typically a size of 512.
+    reduce_mean<<<M, K, sizeof(DType)*K, mshadow::Stream<gpu>::GetStream(s)>>> (N, data.dptr_, mean.dptr_);
+    MSHADOW_CUDA_POST_KERNEL_CHECK(reduce_mean);
+    reduce_std<<<M, K, sizeof(DType)*K, mshadow::Stream<gpu>::GetStream(s)>>> (N, DType(param.eps), data.dptr_, mean.dptr_, std.dptr_, out.dptr_);
+    MSHADOW_CUDA_POST_KERNEL_CHECK(reduce_std);
+    Kernel<ScaleAndShift, gpu>::Launch(s, M*N, N, out.dptr_, std.dptr_, beta.dptr_, gamma.dptr_);
+  });
+}
+#endif
 
 template<typename xpu>
 void LayerNormCompute(const nnvm::NodeAttrs& attrs,
@@ -191,26 +221,7 @@ void LayerNormCompute(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(inputs.size(), 3U);
   Stream<xpu> *s = ctx.get_stream<xpu>();
   if (axis == inputs[0].ndim()-1 ) {
-    MSHADOW_SGL_DBL_TYPE_SWITCH(outputs[0].type_flag_, DType, {
-      using namespace mxnet_op;
-      Tensor<xpu, 2, DType> data  = inputs[layernorm::kData].FlatTo2D<xpu, DType>(s);
-      Tensor<xpu, 1, DType> beta  = inputs[layernorm::kBeta].FlatTo1D<xpu, DType>(s);
-      Tensor<xpu, 1, DType> gamma = inputs[layernorm::kGamma].FlatTo1D<xpu, DType>(s);
-      Tensor<xpu, 2, DType> out   = outputs[layernorm::kOut].FlatTo2D<xpu, DType>(s);
-      Tensor<xpu, 1, DType> mean  = outputs[layernorm::kMean].FlatTo1D<xpu, DType>(s);
-      Tensor<xpu, 1, DType> std   = outputs[layernorm::kStd].FlatTo1D<xpu, DType>(s);
-      const int M(data.size(0)), N(data.size(1));
-      //std::cout<<"LAYER NORM: BATCH = "<<M<<" layer = "<<N<<std::endl;
-      CHECK_EQ(mean.size(0), M);
-      CHECK_EQ(std.size(0), M);
-      CHECK_EQ(beta.size(0), N);
-      CHECK_EQ(gamma.size(0), N);
-      const int K(GetLaunchK<xpu>(M, N));
-      Tensor<xpu, 1, DType> work = ctx.requested[0].get_space_typed<xpu, 1, DType>(Shape1(K*M), s);
-      Kernel<ReduceMean<xpu>, xpu>::Launch(s, M*K, N, K, data.dptr_, work.dptr_, mean.dptr_);
-      Kernel<ReduceVar<xpu>, xpu>::Launch(s, M*K, N, K, DType(param.eps), mean.dptr_, data.dptr_, work.dptr_, out.dptr_, std.dptr_);
-      Kernel<ScaleAndShift, xpu>::Launch(s, M*N, N, DType(param.eps), out.dptr_, std.dptr_, beta.dptr_, gamma.dptr_);
-    });
+    LayerNormComputeFast<xpu>(attrs, ctx, inputs, req, outputs);
     return;
   }
 
