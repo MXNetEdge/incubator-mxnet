@@ -243,6 +243,7 @@ void SockeyeBeamSearchForwardCpu(const nnvm::NodeAttrs& attrs,
                       [&](const int& i1, const int& i2){ return scores[i1] < scores[i2]; });
     // Select associated rows, cols, scores.
     for (int j = 0; j < beam_size; ++j ) {
+ //printf("REAL TOPK i = %d, val = %d / %f\n",j, tmp[j], scores[tmp[j]]);
       scores_acc[i+j] = scores[tmp[j]]; 
       best_hyp[i+j] = tmp[j]/N;
       best_word_indices[i+j] = tmp[j]%N;
@@ -302,14 +303,14 @@ void SockeyeBeamSearchForwardCpu(const nnvm::NodeAttrs& attrs,
 }
 
 template<typename xpu>
-void SockeyeBeamSearchForward(const nnvm::NodeAttrs& attrs,
+MSHADOW_FORCE_INLINE void SockeyeBeamSearchForward(const nnvm::NodeAttrs& attrs,
                               const OpContext& ctx,
                               const std::vector<TBlob>& inputs,
                               const std::vector<OpReqType>& req,
                               const std::vector<TBlob>& outputs) {}
 
 template<>
-void SockeyeBeamSearchForward<cpu>(const nnvm::NodeAttrs& attrs,
+MSHADOW_FORCE_INLINE void SockeyeBeamSearchForward<cpu>(const nnvm::NodeAttrs& attrs,
                                    const OpContext& ctx,
                                    const std::vector<TBlob>& inputs,
                                    const std::vector<OpReqType>& req,
@@ -320,6 +321,262 @@ void SockeyeBeamSearchForward<cpu>(const nnvm::NodeAttrs& attrs,
     SockeyeBeamSearchForwardCpu<DType>(attrs, ctx, inputs, req, outputs);
   });
 }
+
+#ifdef __CUDACC__
+
+template<typename DType>
+MSHADOW_XINLINE void MergeTopK(int K, DType *val1, int *ind1, DType *val2, int *ind2, DType *val_buff, int *ind_buff) {
+  int i1(0), i2(0);
+  for( int i = 0; i < K; ++i ) {
+    if( i1 < K && val1[i1] < val2[i2] ) {
+      val_buff[i] = val1[i1];
+      ind_buff[i] = ind1[i1];
+      ++i1;       
+    } else {
+      val_buff[i] = val2[i2];
+      ind_buff[i] = ind2[i2];
+      ++i2;       
+    }
+  }
+  for( int i = 0; i < K; ++i ) {
+    val1[i] = val_buff[i];
+    ind1[i] = ind_buff[i];
+  }
+}
+
+template<typename DType>
+__global__ void find_best_hyp(int t, int N, int beam_size, int pad_id, int restrict_vocab, DType infty, 
+                              int *best_hyp, int *best_word_indices, int *finished, 
+                              DType *scores, DType *scores_acc, DType *vocab_id, DType *penalties) {
+  // "beam" refers to "beam_size" rows of the data. 
+  const int beam(blockIdx.x);
+  // First/last element in the "scores" array that will be processed.
+  const int first(beam*beam_size*N+threadIdx.x), last(N*(beam*beam_size+(t == 1 ? 1 : beam_size)));
+  // Buffer for blockwise reduction. Partitioned into a section for indices and a section for scores.
+  // 2*beam_size elements per thread of either data, i.e. for a beam size of 5 this are 80 byte/thread. 
+  extern __shared__ int buff[];
+  // Determine start of the buffer sections for this thread. 
+  const int offset(threadIdx.x*2*beam_size);
+  int *ind_buff = &buff[offset];
+  DType *val_buff = ((DType *)&buff[blockDim.x*2*beam_size])+offset;
+  // Initialize top-K values for this thread. 
+  for( int i = 0; i < beam_size; ++i ) {
+    val_buff[i] = infty;
+  }
+  // Process all score values associated with this thread. 
+  for( int i = first; i < last; i += blockDim.x ) {
+    // Data row of this element.
+    const int row(i/N);
+    // Adjust score values
+    DType val(scores[i]);
+    val = finished[row] ? (i == row*N+pad_id ? scores_acc[row] : infty)
+                        : (val+scores_acc[row]*penalties[2*row])/penalties[2*row+1];  
+    scores[i] = val;
+    for (int k = beam_size; k-- && val_buff[k] > val; ) {
+      // Writing to "k+1" is save as buffers are 2*beam_size long.
+      val_buff[k+1] = val_buff[k];
+      ind_buff[k+1] = ind_buff[k];
+      val_buff[k]   = val;
+      ind_buff[k]   = i;
+    }
+  }
+  // Recursive merge on thread block.
+  for (unsigned int s = (blockDim.x+1)/2, last_s = blockDim.x; last_s > 1; last_s = s, s = (s+1)/2) {
+    __syncthreads();
+    if (threadIdx.x < s && threadIdx.x+s < last_s ) {
+      const int K(beam_size);
+      MergeTopK(K, val_buff, ind_buff, val_buff+s*2*K, ind_buff+s*2*K, val_buff+K, ind_buff+K);
+    }
+  }
+  // Final updates on master thread. 
+  if( threadIdx.x == 0 ) {
+    for (int i = 0; i < beam_size; ++i) {
+ //printf("TOPK i = %d, val = %d / %f\n",i, ind_buff[i], val_buff[i]);
+      const int row(beam*beam_size+i);
+      scores_acc[row] = val_buff[i];
+      best_hyp[row] = ind_buff[i]/N;
+      best_word_indices[row] = ind_buff[i]%N;
+      if (restrict_vocab) {
+        best_word_indices[row] = int(vocab_id[best_word_indices[row]]);
+      }
+    } 
+  }
+}
+
+template<typename DType>
+__global__ void update_with_best(int t, int max_output_length, int encoded_source_length, int pad_id, int eos_id,
+                                 int *sequences, int *best_word_indices, int *finished, int *out, 
+                                 DType *lengths, DType *att_scores, DType *att) {
+  extern __shared__ int done[];
+  // We will only call it with a single thread block. 
+  // "beam" refers to one row of the data. 
+  const int beam(threadIdx.x);
+  // # (5) update best hypotheses, their attention lists and lengths (only for non-finished hyps)
+  // sequences[:, t] = best_word_indices
+  sequences[beam*max_output_length+t] = best_word_indices[beam];
+  // attentions[:, t, :] = attention_scores
+  att += (beam*max_output_length+t)*encoded_source_length;
+  att_scores += beam*encoded_source_length;
+  for( int i = 0; i < encoded_source_length; ++i ) {
+    att[i] = att_scores[i];
+  }
+  //lengths += mx.nd.cast(1 - mx.nd.expand_dims(finished, axis=1), dtype='float32')
+  lengths[beam] += 1.0 - finished[beam];
+  // # (6) determine which hypotheses in the beam are now finished
+  // finished = ((best_word_indices == C.PAD_ID) + (best_word_indices == self.vocab_target[C.EOS_SYMBOL]))
+  finished[beam] = ((best_word_indices[beam] == pad_id) || (best_word_indices[beam] == eos_id) ? 1 : 0);
+  done[beam] = finished[beam];
+  for (unsigned int s = (blockDim.x+1)/2, last_s = blockDim.x; last_s > 1; last_s = s, s = (s+1)/2) {
+    __syncthreads();
+    if (beam < s && beam+s < last_s ) {
+      done[beam] = done[beam] && done[beam+s];
+    }
+  }
+  if( beam == 0 ) {
+    *out = done[beam];
+  }
+}
+
+template<typename DType>
+__device__ void take_rows(int M, int N, DType *matrix, DType *work, int *rows) {
+  const int first(threadIdx.x), last(M*N);
+  for( int i = first; i < last; i += blockDim.x ) {
+    work[i] = matrix[rows[i/N]*N+i%N];
+  }
+  __syncthreads();
+  for( int i = first; i < last; i += blockDim.x ) {
+    matrix[i] = work[i];
+  }
+}
+
+template<typename DType0, typename DType1, typename DType2, typename DType3, typename DType4>
+__global__ void take_rows_batch(int M, int N0, int N1, int N2, int N3, int N4, int *rows, 
+                                DType0 *matrix0, DType1 *matrix1, DType2 *matrix2, DType3 *matrix3, DType4 *matrix4, 
+                                DType0 *work0, DType1* work1, DType2 *work2, DType3 *work3, DType4 *work4) { 
+  if( blockIdx.x == 0 && matrix0) take_rows(M, N0, matrix0, work0, rows);
+  if( blockIdx.x == 1 && matrix1) take_rows(M, N1, matrix1, work1, rows);
+  if( blockIdx.x == 2 && matrix2) take_rows(M, N2, matrix2, work2, rows);
+  if( blockIdx.x == 3 && matrix3) take_rows(M, N3, matrix3, work3, rows);
+  if( blockIdx.x == 4 && matrix4) take_rows(M, N4, matrix4, work4, rows);
+}
+
+struct TakeRowsGpu {
+  template<typename DType>
+  MSHADOW_XINLINE static void Map(int i, int N, DType *in, DType *out, int *rows) {
+    out[i] = rows ? in[rows[i/N]*N+i%N] : in[i];
+  }
+};
+
+
+template<typename DType>
+void TakeRows(DType *matrix, DType *buffer, int *rows, int M, int N, mshadow::Stream<gpu> *s) {
+  mxnet_op::Kernel<TakeRowsGpu, gpu>::Launch(s, M*N, N, matrix, buffer, rows);
+  mxnet_op::Kernel<TakeRowsGpu, gpu>::Launch(s, M*N, N, buffer, matrix, (int *)0);
+}
+
+struct ComputeLengthPenalties {
+  template<typename DType>
+  MSHADOW_XINLINE static void Map(int i, DType alpha, DType beta, DType *lengths, DType *out) {
+    out[2*i]   = pow((beta + lengths[i]-1)/(beta + 1), alpha);
+    out[2*i+1] = pow((beta + lengths[i])/(beta + 1), alpha);
+  }
+};
+
+template<typename DType>
+void SockeyeBeamSearchForwardGpu(const nnvm::NodeAttrs& attrs,
+                                 const OpContext& ctx,
+                                 const std::vector<TBlob>& inputs,
+                                 const std::vector<OpReqType>& req,
+                                 const std::vector<TBlob>& outputs) {
+  using namespace mshadow;
+  using namespace mxnet_op;
+
+  Stream<gpu> *s = ctx.get_stream<gpu>();
+  auto parms(nnvm::get<SockeyeBeamSearchParam>(attrs.parsed));
+  const int beam_size(parms.beam_size), batch_size(parms.batch_size);
+  const int M(beam_size*batch_size);
+
+  // Infer some values. 
+  const int max_output_length(inputs[beam::katt].shape_[1]);
+  const int encoded_source_length(inputs[beam::katt].shape_[2]);
+ 
+  DType *scores     = inputs[beam::kscore].dptr<DType>();
+  DType *scores_acc = inputs[beam::kscore_acc].dptr<DType>();
+  DType *lengths    = inputs[beam::klen].dptr<DType>();
+  DType *att        = inputs[beam::katt].dptr<DType>();
+  DType *att_scores = inputs[beam::katt_score].dptr<DType>();
+  DType *vocab_id   = inputs[beam::kvoc].dptr<DType>();
+  int   *finished   = inputs[beam::kfin].dptr<int>();
+  int   *best_hyp   = inputs[beam::khyp].dptr<int>();
+  int   *sequences  = inputs[beam::kseq].dptr<int>();
+  
+  // Compute row lengths of the matrices where we later perform a take-operation.
+  // Compute workspace requirements for these takes. 
+  const int N_seq(inputs[beam::kseq].shape_.Size()/M),
+            N_fin(inputs[beam::kfin].shape_.Size()/M),
+            N_len(inputs[beam::klen].shape_.Size()/M),
+            N_att(inputs[beam::katt].shape_.Size()/M),
+            N_att_score(inputs[beam::katt_score].shape_.Size()/M),
+            W_seq(0),
+            W_fin(W_seq+sizeof(int)*M*N_seq),
+            W_len(W_fin+sizeof(int)*M*N_fin),
+            W_att(W_len+sizeof(DType)*M*N_len),
+            W_att_score(W_att+sizeof(DType)*M*N_att),
+            W_all(W_att_score+sizeof(DType)*M*N_att_score);
+
+  // Allocate workspace for the in-place take operations and length penalties and best_word_indices.
+  const int wsize(M*sizeof(int)+std::max(2*M*sizeof(DType), size_t(W_all)));
+  char *wspace = ctx.requested[0].get_space_typed<gpu, 1, char>(Shape1(wsize), s).dptr_;
+  int *best_word_indices = (int *)(wspace);
+  wspace += sizeof(int)*M;
+  DType *wspace_d = (DType *)wspace;
+      
+  Kernel<ComputeLengthPenalties, gpu>::Launch(s, M, DType(parms.alpha), DType(parms.beta), lengths, wspace_d);
+
+  // Every element of the batch gets one thread block assigned. 
+  find_best_hyp<<<batch_size, 256, 256*2*beam_size*(sizeof(int)+sizeof(DType)), mshadow::Stream<gpu>::GetStream(s)>>>
+     (parms.step, inputs[beam::kscore].shape_[1], beam_size, parms.pad_id, parms.restrict_vocab, red::limits::MaxValue<DType>(), 
+      best_hyp, best_word_indices, finished, scores, scores_acc, vocab_id, wspace_d);
+
+  // # (4) get hypotheses and their properties for beam_size winning hypotheses (ascending) 
+  // sequences = mx.nd.take(sequences, best_hyp_indices)
+  // finished = mx.nd.take(finished, best_hyp_indices)
+  // lengths = mx.nd.take(lengths, best_hyp_indices)  
+  // attentions = mx.nd.take(attentions, best_hyp_indices)
+  // attention_scores = mx.nd.take(attention_scores, best_hyp_indices)
+  if( M * N_att > 20000 ) {
+    TakeRows(att, (DType *)(wspace+W_att), best_hyp, M, N_att, s);
+    take_rows_batch<<<4, 1024, 0, mshadow::Stream<gpu>::GetStream(s)>>>
+       (M, N_seq, N_fin, N_len, N_att_score, 0, best_hyp, sequences, finished, lengths, att_scores, (int *)0, 
+        (int *)(wspace+W_seq), (int *)(wspace+W_fin), (DType *)(wspace+W_len), (DType *)(wspace+W_att_score), (int *)0);
+  } else {
+    take_rows_batch<<<5, 1024, 0, mshadow::Stream<gpu>::GetStream(s)>>>
+       (M, N_seq, N_fin, N_len, N_att, N_att_score, best_hyp, sequences, finished, lengths, att, att_scores, 
+        (int *)(wspace+W_seq), (int *)(wspace+W_fin), (DType *)(wspace+W_len), (DType *)(wspace+W_att), (DType *)(wspace+W_att_score));
+  }
+
+  // Must use a single thread block and one thread/data row. 
+  CHECK_LE(M, 700)<<"too big batch size"; 
+  update_with_best<<<1, M, sizeof(int)*M, mshadow::Stream<gpu>::GetStream(s)>>>
+      (parms.step, max_output_length, encoded_source_length, parms.pad_id, parms.eos_id,
+       sequences, best_word_indices, finished, outputs[0].dptr<int>(), 
+       lengths, att_scores, att);
+}
+
+template<>
+MSHADOW_FORCE_INLINE void SockeyeBeamSearchForward<gpu>(const nnvm::NodeAttrs& attrs,
+                                   const OpContext& ctx,
+                                   const std::vector<TBlob>& inputs,
+                                   const std::vector<OpReqType>& req,
+                                   const std::vector<TBlob>& outputs) {
+  // Factor out code into a separate function as MSHADOW_REAL_TYPE_SWITCH
+  // and #pragma mess up together.
+  MSHADOW_REAL_TYPE_SWITCH(inputs[beam::kscore].type_flag_, DType, {
+    SockeyeBeamSearchForwardGpu<DType>(attrs, ctx, inputs, req, outputs);
+  });
+}
+
+#endif
 
 }  // namespace op
 }  // namespace mxnet
