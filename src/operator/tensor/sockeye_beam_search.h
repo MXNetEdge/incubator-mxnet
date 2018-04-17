@@ -325,22 +325,26 @@ MSHADOW_FORCE_INLINE void SockeyeBeamSearchForward<cpu>(const nnvm::NodeAttrs& a
 #ifdef __CUDACC__
 
 template<typename DType>
-MSHADOW_XINLINE void MergeTopK(int K, DType *val1, int *ind1, DType *val2, int *ind2, DType *val_buff, int *ind_buff) {
-  int i1(0), i2(0);
+MSHADOW_XINLINE void MergeTopK(int K, DType *val1, int *ind1, DType *val2, int *ind2) {
+  // In-place merge into val1/ind1
+  int i1(K-1), i2(K-1);
   for( int i = 0; i < K; ++i ) {
-    if( i1 < K && val1[i1] < val2[i2] ) {
-      val_buff[i] = val1[i1];
-      ind_buff[i] = ind1[i1];
-      ++i1;       
-    } else {
-      val_buff[i] = val2[i2];
-      ind_buff[i] = ind2[i2];
-      ++i2;       
+    if( val1[i1] < val2[i2] ) {
+      --i2;
+    } else { 
+      --i1;
     }
   }
-  for( int i = 0; i < K; ++i ) {
-    val1[i] = val_buff[i];
-    ind1[i] = ind_buff[i];
+  for( int i = K; i--; ) {
+    if( i2 < 0 || i1 >= 0 && val1[i1] > val2[i2] ) {
+      val1[i] = val1[i1];
+      ind1[i] = ind1[i1];
+      --i1;
+    } else {
+      val1[i] = val2[i2];
+      ind1[i] = ind2[i2];
+      --i2;
+    }
   }
 }
 
@@ -353,12 +357,12 @@ __global__ void find_best_hyp(int t, int N, int beam_size, int pad_id, int restr
   // First/last element in the "scores" array that will be processed.
   const int first(beam*beam_size*N+threadIdx.x), last(N*(beam*beam_size+(t == 1 ? 1 : beam_size)));
   // Buffer for blockwise reduction. Partitioned into a section for indices and a section for scores.
-  // 2*beam_size elements per thread of either data, i.e. for a beam size of 5 this are 80 byte/thread. 
+  // beam_size elements per thread of either data, i.e. for a beam size of 5 this are 40 byte/thread. 
   extern __shared__ int buff[];
   // Determine start of the buffer sections for this thread. 
-  const int offset(threadIdx.x*2*beam_size);
+  const int offset(threadIdx.x*beam_size);
   int *ind_buff = &buff[offset];
-  DType *val_buff = ((DType *)&buff[blockDim.x*2*beam_size])+offset;
+  DType *val_buff = ((DType *)&buff[blockDim.x*beam_size])+offset;
   // Initialize top-K values for this thread. 
   for( int i = 0; i < beam_size; ++i ) {
     val_buff[i] = infty;
@@ -373,9 +377,10 @@ __global__ void find_best_hyp(int t, int N, int beam_size, int pad_id, int restr
                         : (val+scores_acc[row]*penalties[2*row])/penalties[2*row+1];  
     scores[i] = val;
     for (int k = beam_size; k-- && val_buff[k] > val; ) {
-      // Writing to "k+1" is save as buffers are 2*beam_size long.
-      val_buff[k+1] = val_buff[k];
-      ind_buff[k+1] = ind_buff[k];
+      if( k+1 < beam_size ) {
+        val_buff[k+1] = val_buff[k];
+        ind_buff[k+1] = ind_buff[k];
+      }
       val_buff[k]   = val;
       ind_buff[k]   = i;
     }
@@ -384,14 +389,12 @@ __global__ void find_best_hyp(int t, int N, int beam_size, int pad_id, int restr
   for (unsigned int s = (blockDim.x+1)/2, last_s = blockDim.x; last_s > 1; last_s = s, s = (s+1)/2) {
     __syncthreads();
     if (threadIdx.x < s && threadIdx.x+s < last_s ) {
-      const int K(beam_size);
-      MergeTopK(K, val_buff, ind_buff, val_buff+s*2*K, ind_buff+s*2*K, val_buff+K, ind_buff+K);
+      MergeTopK(beam_size, val_buff, ind_buff, val_buff+s*beam_size, ind_buff+s*beam_size);
     }
   }
   // Final updates on master thread. 
   if( threadIdx.x == 0 ) {
     for (int i = 0; i < beam_size; ++i) {
- //printf("TOPK i = %d, val = %d / %f\n",i, ind_buff[i], val_buff[i]);
       const int row(beam*beam_size+i);
       scores_acc[row] = val_buff[i];
       best_hyp[row] = ind_buff[i]/N;
@@ -534,7 +537,7 @@ void SockeyeBeamSearchForwardGpu(const nnvm::NodeAttrs& attrs,
   Kernel<ComputeLengthPenalties, gpu>::Launch(s, M, DType(parms.alpha), DType(parms.beta), lengths, wspace_d);
 
   // Every element of the batch gets one thread block assigned. 
-  find_best_hyp<<<batch_size, 256, 256*2*beam_size*(sizeof(int)+sizeof(DType)), mshadow::Stream<gpu>::GetStream(s)>>>
+  find_best_hyp<<<batch_size, 1024, 1024*beam_size*(sizeof(int)+sizeof(DType)), mshadow::Stream<gpu>::GetStream(s)>>>
      (parms.step, inputs[beam::kscore].shape_[1], beam_size, parms.pad_id, parms.restrict_vocab, red::limits::MaxValue<DType>(), 
       best_hyp, best_word_indices, finished, scores, scores_acc, vocab_id, wspace_d);
 
