@@ -770,7 +770,6 @@ try {
         timeout(time: max_time, unit: 'MINUTES') {
           init_git()
           sh "ci/build.py --platform ubuntu_cpu /work/runtime_functions.sh deploy_docs"
-          sh "tests/ci_build/deploy/ci_deploy_doc.sh ${env.BRANCH_NAME} ${env.BUILD_NUMBER}"
         }        
       }
     }
