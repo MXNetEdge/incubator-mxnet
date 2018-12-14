@@ -20,12 +20,12 @@
 
 mx_lib = 'lib/libmxnet.so, lib/libmxnet.a, 3rdparty/dmlc-core/libdmlc.a, 3rdparty/tvm/nnvm/lib/libnnvm.a'
 
-node('restricted-utility') {
+node('restricted-mxnetlinux-gpu-p3') {
   // Loading the utilities requires a node context unfortunately
   checkout scm
   utils = load('ci/Jenkinsfile_utils.groovy')
 }
-utils.assign_node_labels(utility: 'restricted-utility', linux_cpu: 'restricted-mxnetlinux-cpu')
+utils.assign_node_labels(utility: 'restricted-mxnetlinux-gpu-p3', linux_cpu: 'restricted-mxnetlinux-gpu-p3')
 
 utils.main_wrapper(
 core_logic: {
